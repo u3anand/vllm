@@ -39,12 +39,21 @@ drifting multi-segment replay leave it unset and join the windows to the replay'
 ``expert_class{consistent|temporal}`` field in the contract is derived *offline* (GEM
 taxonomy), not emitted here.
 
+A second, optional stream ``expert_mb.<pid>.jsonl`` carries **per-micro-batch (per-forward)
+imbalance summary stats** per (layer, phase, window): the per-forward imbalance the all-to-all
+actually suffers, vs the windowed mean the reactive cache sees (Research Plan 2 M1 / the Lina
+comparison). Imbalance is per-simulated-GPU under a round-robin layout of ``VLLM_B2_SIM_GPUS``
+GPUs (``imbalance = max/mean`` of per-GPU load, matching ``b2tel.analysis.imbalance_ratio``),
+on both the token-load and the activated-expert (distinct experts per GPU) quantities. This is
+additive: the main ``expert.jsonl`` schema is unchanged (only its ``phase`` tags get sharper).
+
 Env vars:
   VLLM_B2_EXPERT_LOG_DIR   enable + output directory (unset = disabled)
   VLLM_B2_WINDOW_S         window length in seconds; default 1.0
   VLLM_B2_SAMPLE           fraction of forward calls to count, (0, 1]; default 1.0
   VLLM_B2_SEGMENT          optional segment label copied into each row
   VLLM_B2_REPLICA_ID       optional tag copied into each row
+  VLLM_B2_SIM_GPUS         simulated EP GPUs for round-robin imbalance; default 8
 """
 
 from __future__ import annotations
@@ -80,12 +89,14 @@ def _is_compiling() -> bool:
         return False
 
 
-def _current_phase() -> str:
-    """Best-effort prefill/decode tag for the current forward (Initial Plan 2: phase split).
+def _phase_counts() -> tuple[int | None, int | None]:
+    """Prefill/decode token counts for the current forward, or (None, None) if unknown.
 
-    Reads vLLM's forward context attn-metadata if present; a batch that is all single-token
-    sequences is ``decode``, all multi-token is ``prefill``, otherwise ``mixed``. Falls back
-    to ``mixed`` on any version mismatch — never raises into the model forward.
+    Reads vLLM's forward-context attn-metadata. vLLM packs prefill tokens first, so a caller
+    can slice ``router_logits[:npref]`` → prefill, ``[npref:]`` → decode (Research Plan 2 phase
+    split). **The prefill-first ordering is verified by the capture-time phase-ordering gate**;
+    if it ever fails, attribute phase from per-token metadata instead of this positional split.
+    Never raises into the model forward.
     """
     try:
         from vllm.forward_context import get_forward_context
@@ -93,25 +104,51 @@ def _current_phase() -> str:
         ctx = get_forward_context()
         am = getattr(ctx, "attn_metadata", None)
         if am is None:
-            return "mixed"
+            return None, None
         # attn_metadata may be a dict keyed by layer-group on newer vLLM
         if isinstance(am, dict):
             am = next(iter(am.values()), None)
             if am is None:
-                return "mixed"
+                return None, None
         npref = getattr(am, "num_prefill_tokens", None)
         ndec = getattr(am, "num_decode_tokens", None)
         if npref is None and ndec is None:
-            return "mixed"
-        npref = int(npref or 0)
-        ndec = int(ndec or 0)
-        if npref and not ndec:
-            return "prefill"
-        if ndec and not npref:
-            return "decode"
-        return "mixed"
+            return None, None
+        return int(npref or 0), int(ndec or 0)
     except Exception:
-        return "mixed"
+        return None, None
+
+
+def _p95(xs: list[float]) -> float:
+    """95th percentile of a small list (no numpy in the vLLM hot path)."""
+    if not xs:
+        return 0.0
+    s = sorted(xs)
+    i = min(len(s) - 1, int(round(0.95 * (len(s) - 1))))
+    return float(s[i])
+
+
+def _per_gpu_imbalance(binc: list[int], n_gpus: int) -> tuple[float, float]:
+    """Round-robin (expert e -> GPU e mod D) per-GPU imbalance for one forward.
+
+    Returns (token_load_imbalance, activated_expert_imbalance), each ``max/mean`` over the D
+    GPUs (1.0 = perfectly balanced), matching ``b2tel.analysis.imbalance_ratio``. The
+    activated-expert quantity (distinct experts with load > 0 per GPU) is the weight-load /
+    decode-cost metric (METRO): it can stay skewed even when token-load looks flat.
+    """
+    if n_gpus <= 1:
+        return 1.0, 1.0
+    tok = [0] * n_gpus
+    act = [0] * n_gpus
+    for e, c in enumerate(binc):
+        if c:
+            g = e % n_gpus
+            tok[g] += c
+            act[g] += 1
+    def _ratio(v: list[int]) -> float:
+        m = sum(v) / n_gpus
+        return (max(v) / m) if m > 0 else 1.0
+    return _ratio(tok), _ratio(act)
 
 
 def _init_state():
@@ -133,17 +170,34 @@ def _init_state():
     except ValueError:
         window_s = 1.0
     window_s = max(window_s, 1e-3)
-    path = os.path.join(log_dir, f"expert.{os.getpid()}.jsonl")
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+    try:
+        sim_gpus = int(os.getenv("VLLM_B2_SIM_GPUS", "8"))
+    except ValueError:
+        sim_gpus = 8
+    sim_gpus = max(1, sim_gpus)
+    pid = os.getpid()
+    fd = os.open(
+        os.path.join(log_dir, f"expert.{pid}.jsonl"),
+        os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644,
+    )
+    fd_mb = os.open(
+        os.path.join(log_dir, f"expert_mb.{pid}.jsonl"),
+        os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644,
+    )
     return {
         "fd": fd,
+        "fd_mb": fd_mb,
         "stride": stride,
         "window_s": window_s,
+        "sim_gpus": sim_gpus,
         "segment": os.getenv("VLLM_B2_SEGMENT"),
         "replica_id": os.getenv("VLLM_B2_REPLICA_ID"),
         # mutable accumulator state (guarded by _lock):
         "call_counts": {},              # layer_id -> forward-call count (for striding)
         "counts": {},                   # (layer_id, phase) -> {expert_id: token_load}
+        # (layer_id, phase) -> per-forward imbalance lists for micro-batch summary:
+        #   {"tok": [..], "act": [..], "tokens": int}
+        "mb": {},
         "n_experts": 0,
         "top_k": 0,
         "window_id": 0,
@@ -195,9 +249,37 @@ def _flush_locked(state: dict, t_end: float) -> None:
                 if replica_id is not None:
                     record["replica_id"] = replica_id
                 os.write(fd, _dumps(record))
+        # per-micro-batch imbalance summary (one row per layer/phase/window)
+        fd_mb = state["fd_mb"]
+        sim_gpus = state["sim_gpus"]
+        for (layer_id, phase), acc in state["mb"].items():
+            tok, act = acc["tok"], acc["act"]
+            mb_rec = {
+                "window_id": window_id,
+                "t_start": t_start,
+                "t_end": t_end,
+                "layer_id": int(layer_id),
+                "phase": phase,
+                "n_forwards": len(tok),
+                "tokens": int(acc["tokens"]),
+                "n_sim_gpus": int(sim_gpus),
+                "tok_imb_mean": (sum(tok) / len(tok)) if tok else 0.0,
+                "tok_imb_p95": _p95(tok),
+                "tok_imb_max": max(tok) if tok else 0.0,
+                "act_imb_mean": (sum(act) / len(act)) if act else 0.0,
+                "act_imb_p95": _p95(act),
+                "act_imb_max": max(act) if act else 0.0,
+                "pid": os.getpid(),
+            }
+            if segment is not None:
+                mb_rec["segment_label"] = segment
+            if replica_id is not None:
+                mb_rec["replica_id"] = replica_id
+            os.write(fd_mb, _dumps(mb_rec))
         state["window_id"] = window_id + 1
     # reset for next window
     state["counts"] = {}
+    state["mb"] = {}
     state["window_start_wall"] = t_end
 
 
@@ -233,19 +315,46 @@ def maybe_log_expert_load(
             _flush_locked(state, now)  # closes the elapsed window, opens a fresh one
 
         logits = router_logits.detach()
+        num_tokens = int(logits.shape[0])
         n_experts = int(logits.shape[-1])
         k = min(top_k, n_experts)
-        # top-k expert ids per token, then count occurrences per expert
-        sel = torch.topk(logits, k, dim=-1).indices.reshape(-1)
-        binc = torch.bincount(sel, minlength=n_experts).to("cpu").tolist()
-
         state["n_experts"] = n_experts
         state["top_k"] = k
-        phase = _current_phase()
-        layer_counts = state["counts"].setdefault((layer_id, phase), {})
-        for expert_id, c in enumerate(binc):
-            if c:
-                layer_counts[expert_id] = layer_counts.get(expert_id, 0) + c
+
+        # Split this forward's tokens into prefill/decode using vLLM's prefill-first
+        # packing (verified by the capture-time phase-ordering gate). Fall back to a single
+        # "mixed" group when the counts are unavailable or don't line up with the logits rows
+        # (e.g. sequence-parallel chunking) — never guess.
+        npref, ndec = _phase_counts()
+        if npref is not None and ndec is not None and (npref + ndec) == num_tokens:
+            groups = []
+            if npref > 0:
+                groups.append(("prefill", 0, npref))
+            if ndec > 0:
+                groups.append(("decode", npref, num_tokens))
+        else:
+            groups = [("mixed", 0, num_tokens)]
+
+        sim_gpus = state["sim_gpus"]
+        for phase, lo, hi in groups:
+            if hi <= lo:
+                continue
+            # top-k expert ids per token in this phase slice, then count per expert
+            sel = torch.topk(logits[lo:hi], k, dim=-1).indices.reshape(-1)
+            binc = torch.bincount(sel, minlength=n_experts).to("cpu").tolist()
+            layer_counts = state["counts"].setdefault((layer_id, phase), {})
+            for expert_id, c in enumerate(binc):
+                if c:
+                    layer_counts[expert_id] = layer_counts.get(expert_id, 0) + c
+            # per-micro-batch (per-forward) imbalance — what this all-to-all suffers, vs the
+            # windowed mean the reactive cache sees (M1 / Lina comparison)
+            tok_imb, act_imb = _per_gpu_imbalance(binc, sim_gpus)
+            acc = state["mb"].setdefault(
+                (layer_id, phase), {"tok": [], "act": [], "tokens": 0}
+            )
+            acc["tok"].append(tok_imb)
+            acc["act"].append(act_imb)
+            acc["tokens"] += hi - lo
 
 
 def flush_expert_load() -> None:
