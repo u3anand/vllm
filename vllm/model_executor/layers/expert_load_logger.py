@@ -89,34 +89,49 @@ def _is_compiling() -> bool:
         return False
 
 
-def _phase_counts() -> tuple[int | None, int | None]:
-    """Prefill/decode token counts for the current forward, or (None, None) if unknown.
+def _phase_token_mask(num_tokens: int):
+    """Per-token decode mask for the current forward, or None if unavailable.
 
-    Reads vLLM's forward-context attn-metadata. vLLM packs prefill tokens first, so a caller
-    can slice ``router_logits[:npref]`` → prefill, ``[npref:]`` → decode (Research Plan 2 phase
-    split). **The prefill-first ordering is verified by the capture-time phase-ordering gate**;
-    if it ever fails, attribute phase from per-token metadata instead of this positional split.
-    Never raises into the model forward.
+    vLLM **V1** does not expose ``num_prefill_tokens``/``num_decode_tokens`` (those were V0); it
+    exposes ``query_start_loc`` — cumulative per-request query offsets. A request whose query
+    length is 1 is a *decode* step; length > 1 is *prefill*. We build a bool mask (True =
+    decode) of length ``num_tokens`` aligned with the ``router_logits`` rows (the MoE block
+    operates on the same flattened token order as attention). This is per-token attribution, so
+    it does not rely on any prefill-first packing. Returns None on any version/shape mismatch —
+    never guesses, never raises into the model forward.
     """
     try:
+        import torch
         from vllm.forward_context import get_forward_context
 
         ctx = get_forward_context()
         am = getattr(ctx, "attn_metadata", None)
         if am is None:
-            return None, None
+            return None
         # attn_metadata may be a dict keyed by layer-group on newer vLLM
         if isinstance(am, dict):
             am = next(iter(am.values()), None)
             if am is None:
-                return None, None
-        npref = getattr(am, "num_prefill_tokens", None)
-        ndec = getattr(am, "num_decode_tokens", None)
-        if npref is None and ndec is None:
-            return None, None
-        return int(npref or 0), int(ndec or 0)
+                return None
+        qsl = getattr(am, "query_start_loc_cpu", None)
+        if qsl is None:
+            qsl = getattr(am, "query_start_loc", None)
+        if qsl is None:
+            return None
+        q = qsl.detach().to("cpu")
+        qlens = (q[1:] - q[:-1]).tolist()
+        if int(sum(qlens)) != int(num_tokens):
+            return None
+        mask = torch.zeros(num_tokens, dtype=torch.bool)
+        pos = 0
+        for L in qlens:
+            L = int(L)
+            if L == 1:  # single-token request this step => decode
+                mask[pos] = True
+            pos += L
+        return mask
     except Exception:
-        return None, None
+        return None
 
 
 def _p95(xs: list[float]) -> float:
@@ -321,26 +336,31 @@ def maybe_log_expert_load(
         state["n_experts"] = n_experts
         state["top_k"] = k
 
-        # Split this forward's tokens into prefill/decode using vLLM's prefill-first
-        # packing (verified by the capture-time phase-ordering gate). Fall back to a single
-        # "mixed" group when the counts are unavailable or don't line up with the logits rows
-        # (e.g. sequence-parallel chunking) — never guess.
-        npref, ndec = _phase_counts()
-        if npref is not None and ndec is not None and (npref + ndec) == num_tokens:
+        # Split this forward's tokens into prefill/decode via a per-token mask from
+        # query_start_loc (qlen==1 => decode). Per-token attribution, so it does not assume any
+        # prefill-first packing. Falls back to a single "mixed" group when the mask is
+        # unavailable (version mismatch / shape mismatch) — never guess.
+        mask = _phase_token_mask(num_tokens)
+        if mask is not None:
+            mask = mask.to(logits.device)
+            n_dec = int(mask.sum().item())
             groups = []
-            if npref > 0:
-                groups.append(("prefill", 0, npref))
-            if ndec > 0:
-                groups.append(("decode", npref, num_tokens))
+            if n_dec < num_tokens:
+                groups.append(("prefill", ~mask))
+            if n_dec > 0:
+                groups.append(("decode", mask))
         else:
-            groups = [("mixed", 0, num_tokens)]
+            groups = [("mixed", None)]
 
         sim_gpus = state["sim_gpus"]
-        for phase, lo, hi in groups:
-            if hi <= lo:
+        for phase, sel_mask in groups:
+            # rows for this phase: all tokens (mixed) or the masked subset
+            sub = logits if sel_mask is None else logits[sel_mask]
+            n_sub = int(sub.shape[0])
+            if n_sub == 0:
                 continue
-            # top-k expert ids per token in this phase slice, then count per expert
-            sel = torch.topk(logits[lo:hi], k, dim=-1).indices.reshape(-1)
+            # top-k expert ids per token in this phase group, then count per expert
+            sel = torch.topk(sub, k, dim=-1).indices.reshape(-1)
             binc = torch.bincount(sel, minlength=n_experts).to("cpu").tolist()
             layer_counts = state["counts"].setdefault((layer_id, phase), {})
             for expert_id, c in enumerate(binc):
@@ -354,7 +374,7 @@ def maybe_log_expert_load(
             )
             acc["tok"].append(tok_imb)
             acc["act"].append(act_imb)
-            acc["tokens"] += hi - lo
+            acc["tokens"] += n_sub
 
 
 def flush_expert_load() -> None:
