@@ -40,11 +40,13 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from vllm.model_executor.layers.attention import Attention
+from vllm.model_executor.layers.expert_load_logger import maybe_log_expert_load
 from vllm.model_executor.layers.fused_moe import (
     FusedMoE,
     fused_moe_make_expert_params_mapping,
 )
 from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.layers.router_logit_logger import maybe_log_router_logits
 from vllm.model_executor.layers.linear import (
     QKVParallelLinear,
     ReplicatedLinear,
@@ -67,6 +69,7 @@ from .interfaces import MixtureOfExperts, SupportsLoRA, SupportsPP
 from .utils import (
     AutoWeightsLoader,
     PPMissingLayer,
+    extract_layer_index,
     is_pp_missing_parameter,
     make_empty_intermediate_tensors_factory,
     make_layers,
@@ -98,6 +101,8 @@ class MixtralMoE(nn.Module):
     ):
         super().__init__()
         self.hidden_size = hidden_size
+        self.layer_idx = extract_layer_index(prefix)  # B1/B2: tag routing records
+        self.top_k = top_k
 
         self.ep_group = get_ep_group().device_group
         self.ep_rank = get_ep_group().rank_in_group
@@ -150,6 +155,8 @@ class MixtralMoE(nn.Module):
         hidden_states = hidden_states.view(-1, self.hidden_size)
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
+        maybe_log_router_logits(router_logits, self.layer_idx)  # B1 Q6 (no-op if off)
+        maybe_log_expert_load(router_logits, self.layer_idx, self.top_k)  # B2 (no-op if off)
         final_hidden_states = self.experts(hidden_states, router_logits)
         return final_hidden_states.view(orig_shape)
 

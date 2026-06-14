@@ -43,11 +43,13 @@ from vllm.distributed import (
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.attention import Attention
+from vllm.model_executor.layers.expert_load_logger import maybe_log_expert_load
 from vllm.model_executor.layers.fused_moe import (
     FusedMoE,
     fused_moe_make_expert_params_mapping,
 )
 from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.layers.router_logit_logger import maybe_log_router_logits
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
@@ -152,6 +154,8 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         self.ep_rank = get_ep_group().rank_in_group
         self.ep_size = self.ep_group.size()
         self.n_routed_experts = config.num_experts
+        self.layer_idx = extract_layer_index(prefix)  # B1/B2: tag routing records
+        self.top_k = config.num_experts_per_tok
 
         self.is_sequence_parallel = parallel_config.use_sequence_parallel_moe
 
@@ -208,9 +212,14 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             self.shared_expert_gate = None
             self.shared_expert = None
 
+        # B2: do NOT pass gate=self.gate into FusedMoE. With an internal router the
+        # gate runs inside the fused kernel and router_logits are never exposed to a
+        # python hook (the dead `else` branch below). Omitting it makes
+        # is_internal_router() False (moe_runner: `return self.gate is not None`), so the
+        # external-gate path runs and `maybe_log_expert_load` can see router_logits —
+        # mirroring olmoe/qwen2_moe. Safe here: Qwen3-30B-A3B has no shared expert.
         self.experts = FusedMoE(
             shared_experts=self.shared_expert,
-            gate=self.gate,
             num_experts=self.n_routed_experts,
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
@@ -240,10 +249,11 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                 hidden_states=hidden_states, router_logits=hidden_states
             )
         else:
-            # Actually this will be dead code, since we always pass gate into
-            # FusedMoE in the current implementation. But we keep this code
-            # here for clarity and future flexibility.
+            # B2: live path — we deliberately omit gate= from FusedMoE so the router
+            # runs here and router_logits are visible to the telemetry hooks.
             router_logits, _ = self.gate(hidden_states)
+            maybe_log_router_logits(router_logits, self.layer_idx)  # B1 Q6 (no-op if off)
+            maybe_log_expert_load(router_logits, self.layer_idx, self.top_k)  # B2 (no-op if off)
             final_hidden_states = self.experts(
                 hidden_states=hidden_states, router_logits=router_logits
             )
